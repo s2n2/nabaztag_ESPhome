@@ -1,0 +1,451 @@
+substitutions:
+  name: nabaztag_esp
+  friendly_name: Nabaztag
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  project:
+    name: esphome.web
+    version: '1.0'
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          id(right_ear_direction) = true;
+          id(left_ear_direction) = true;
+
+          auto right_call = id(motor_ear_right).make_call();
+          right_call.set_direction(fan::FanDirection::FORWARD);
+          right_call.perform();
+
+          auto left_call = id(motor_ear_left).make_call();
+          left_call.set_direction(fan::FanDirection::FORWARD);
+          left_call.perform();
+
+          ESP_LOGD("ears", "Default direction set to Forward on boot.");
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: WARN
+
+api:
+
+ota:
+  platform: esphome
+
+improv_serial:
+
+wifi:
+  ap: {}
+
+captive_portal:
+
+web_server:
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO15
+      mode:
+        input: true
+        pullup: true
+    name: "Button Head"
+    filters:
+      - invert
+    on_press:
+      - delay: 1s  # Wait 1 second to detect a long press
+      - lambda: |-
+          ESP_LOGD("ears", "Long button press detected. Resetting ears.");
+
+          id(right_ear_position) = 1;
+          id(left_ear_position) = 1;
+          ESP_LOGD("ears", "Ear positions reset to 1.");
+
+          // Wiggle ears to confirm reset
+          for (int i = 0; i < 3; i++) {
+              id(motor_ear_right).turn_on();
+              id(motor_ear_left).turn_on();
+              delay(200);
+              id(motor_ear_right).turn_off();
+              id(motor_ear_left).turn_off();
+              delay(200);
+          }
+          ESP_LOGD("ears", "Ears wiggled to confirm reset.");
+
+          // Set target to 0 and return
+          id(target_right_ear_position) = 1;
+          id(target_left_ear_position) = 1;
+
+output:
+  - platform: ledc
+    id: motor_forward_pin_rightear
+    pin: GPIO21
+  - platform: ledc
+    id: motor_reverse_pin_rightear
+    pin: GPIO3
+
+  - platform: ledc
+    id: motor_forward_pin_leftear
+    pin: GPIO19
+  - platform: ledc
+    id: motor_reverse_pin_leftear
+    pin: GPIO18
+
+fan:
+  - platform: hbridge
+    id: motor_ear_right
+    name: "Ear Motor Right"
+    pin_a: motor_forward_pin_rightear
+    pin_b: motor_reverse_pin_rightear
+    decay_mode: fast
+
+  - platform: hbridge
+    id: motor_ear_left
+    name: "Ear Motor Left"
+    pin_a: motor_forward_pin_leftear
+    pin_b: motor_reverse_pin_leftear
+    decay_mode: fast
+
+globals:
+  - id: right_stop_at_target
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: left_stop_at_target
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: right_ear_rotation_time
+    type: int
+    restore_value: no
+    initial_value: '11894'
+
+  - id: left_ear_rotation_time
+    type: int
+    restore_value: no
+    initial_value: '12540'
+
+  - id: right_ear_position
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: left_ear_position
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: right_ear_direction
+    type: bool
+    restore_value: no
+    initial_value: 'true'  # true = forward, false = backward
+
+  - id: left_ear_direction
+    type: bool
+    restore_value: no
+    initial_value: 'true'  # true = forward, false = backward
+
+  - id: ear_steps
+    type: int
+    restore_value: no
+    initial_value: '20'
+
+  - id: target_right_ear_position
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: target_left_ear_position
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: right_last_step_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: left_last_step_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_logged_right_position
+    type: int
+    restore_value: no
+    initial_value: '-1'
+
+  - id: last_logged_left_position
+    type: int
+    restore_value: no
+    initial_value: '-1'
+
+  - id: right_stop_behavior
+    type: int
+    restore_value: yes
+    initial_value: '1'  # 0 = Stop Instantly, 1 = Return to Target
+
+  - id: left_stop_behavior
+    type: int
+    restore_value: yes
+    initial_value: '1'  # 0 = Stop Instantly, 1 = Return to Target
+
+
+number:
+  - platform: template
+    name: "Right Ear Target Position"
+    id: right_ear_target_number
+    min_value: 1
+    max_value: 20
+    step: 1
+    initial_value: 1
+    set_action:
+      - lambda: |-
+          id(target_right_ear_position) = int(x) - 1; // Convert 1-20 to 0-19 internally
+          
+  - platform: template
+    name: "Left Ear Target Position"
+    id: left_ear_target_number
+    min_value: 1
+    max_value: 20
+    step: 1
+    initial_value: 1
+    set_action:
+      - lambda: |-
+          id(target_left_ear_position) = int(x) - 1; // Convert 1-20 to 0-19 internally
+
+sensor:
+  - platform: template
+    name: "Right Ear Current Position"
+    id: right_ear_current_position
+    accuracy_decimals: 0
+    lambda: |-
+      return id(right_ear_position) + 1; // Convert 0-19 to 1-20 for UI
+
+  - platform: template
+    name: "Left Ear Current Position"
+    id: left_ear_current_position
+    accuracy_decimals: 0
+    lambda: |-
+      return id(left_ear_position) + 1; // Convert 0-19 to 1-20 for UI
+
+switch:
+  - platform: template
+    name: "Right Ear Power"
+    id: right_ear_power
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          auto right_call = id(motor_ear_right).make_call();
+          right_call.set_state(true);
+          right_call.perform();
+          ESP_LOGD("ears", "Right ear manually turned ON.");
+    turn_off_action:
+      - lambda: |-
+          if (id(right_stop_behavior) == 1) {
+              if (!id(right_stop_at_target)) {
+                  id(right_stop_at_target) = true;
+                  ESP_LOGD("ears", "Right ear manually turned OFF, but returning to target.");
+              }
+          } else {
+              id(target_right_ear_position) = id(right_ear_position);
+              id(right_stop_at_target) = false;
+              auto right_call = id(motor_ear_right).make_call();
+              right_call.set_state(false);
+              right_call.perform();
+              ESP_LOGD("ears", "Right ear manually turned OFF (Instant stop).");
+              id(right_ear_power).publish_state(false);
+          }
+
+  - platform: template
+    name: "Left Ear Power"
+    id: left_ear_power
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          auto left_call = id(motor_ear_left).make_call();
+          left_call.set_state(true);
+          left_call.perform();
+          ESP_LOGD("ears", "Left ear manually turned ON.");
+    turn_off_action:
+      - lambda: |-
+          if (id(left_stop_behavior) == 1) {
+              if (!id(left_stop_at_target)) {
+                  id(left_stop_at_target) = true;
+                  ESP_LOGD("ears", "Left ear manually turned OFF, but returning to target.");
+              }
+          } else {
+              id(target_left_ear_position) = id(left_ear_position);
+              id(left_stop_at_target) = false;
+              auto left_call = id(motor_ear_left).make_call();
+              left_call.set_state(false);
+              left_call.perform();
+              ESP_LOGD("ears", "Left ear manually turned OFF (Instant stop).");
+              id(left_ear_power).publish_state(false);
+          }
+
+  - platform: template
+    name: "Right Ear Direction Forwards"
+    id: right_ear_direction_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          if (!id(right_stop_at_target)) {
+              id(right_ear_direction) = true;
+              auto right_call = id(motor_ear_right).make_call();
+              right_call.set_direction(fan::FanDirection::FORWARD);
+              right_call.perform();
+              ESP_LOGD("ears", "Right ear direction set to Forward.");
+          }
+    turn_off_action:
+      - lambda: |-
+          if (!id(right_stop_at_target)) {
+              id(right_ear_direction) = false;
+              auto right_call = id(motor_ear_right).make_call();
+              right_call.set_direction(fan::FanDirection::REVERSE);
+              right_call.perform();
+              ESP_LOGD("ears", "Right ear direction set to Backward.");
+          }
+
+  - platform: template
+    name: "Left Ear Direction Forwards"
+    id: left_ear_direction_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          if (!id(left_stop_at_target)) {
+              id(left_ear_direction) = true;
+              auto left_call = id(motor_ear_left).make_call();
+              left_call.set_direction(fan::FanDirection::FORWARD);
+              left_call.perform();
+              ESP_LOGD("ears", "Left ear direction set to Forward.");
+          }
+    turn_off_action:
+      - lambda: |-
+          if (!id(left_stop_at_target)) {
+              id(left_ear_direction) = false;
+              auto left_call = id(motor_ear_left).make_call();
+              left_call.set_direction(fan::FanDirection::REVERSE);
+              left_call.perform();
+              ESP_LOGD("ears", "Left ear direction set to Backward.");
+          }
+
+  - platform: template
+    name: "Right Ear Stop Instantly"
+    id: right_stop_behavior_switch
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(right_stop_behavior) = 0; // Stop Instantly
+          ESP_LOGD("ears", "Right ear stop behavior set to: Stop Instantly");
+
+    turn_off_action:
+      - lambda: |-
+          id(right_stop_behavior) = 1; // Return to Target
+          ESP_LOGD("ears", "Right ear stop behavior set to: Return to Target");
+
+  - platform: template
+    name: "Left Ear Stop Instantly"
+    id: left_stop_behavior_switch
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(left_stop_behavior) = 0; // Stop Instantly
+          ESP_LOGD("ears", "Left ear stop behavior set to: Stop Instantly");
+
+    turn_off_action:
+      - lambda: |-
+          id(left_stop_behavior) = 1; // Return to Target
+          ESP_LOGD("ears", "Left ear stop behavior set to: Return to Target");
+
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          int current_time = millis();
+          int right_step_time = id(right_ear_rotation_time) / id(ear_steps);
+          int left_step_time = id(left_ear_rotation_time) / id(ear_steps);
+
+          // ✅ Determine if ears should be moving
+          bool right_target_reached = (id(right_ear_position) == id(target_right_ear_position));
+          bool left_target_reached = (id(left_ear_position) == id(target_left_ear_position));
+
+          bool right_moving = id(motor_ear_right).state;
+          bool left_moving = id(motor_ear_left).state;
+
+          bool right_power_on = id(right_ear_power).state;
+          bool left_power_on = id(left_ear_power).state;
+
+          bool right_should_move = right_power_on || !right_target_reached;
+          bool left_should_move = left_power_on || !left_target_reached;
+
+          // ✅ Calculate shortest path with wraparound
+          int right_distance_forward = (id(target_right_ear_position) - id(right_ear_position) + id(ear_steps)) % id(ear_steps);
+          int right_distance_backward = (id(right_ear_position) - id(target_right_ear_position) + id(ear_steps)) % id(ear_steps);
+          bool right_direction = (right_distance_forward <= right_distance_backward);
+
+          int left_distance_forward = (id(target_left_ear_position) - id(left_ear_position) + id(ear_steps)) % id(ear_steps);
+          int left_distance_backward = (id(left_ear_position) - id(target_left_ear_position) + id(ear_steps)) % id(ear_steps);
+          bool left_direction = (left_distance_forward <= left_distance_backward);
+
+          // ✅ Ensure right ear starts moving if required
+          if (right_should_move && !right_moving) {
+              auto right_call = id(motor_ear_right).make_call();
+              right_call.set_direction(right_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+              right_call.set_state(true);
+              right_call.perform();
+              ESP_LOGD("ears", "🚀 Right ear started moving (Direction: %s)", right_direction ? "Forward" : "Backward");
+          }
+
+          // ✅ Ensure left ear starts moving if required
+          if (left_should_move && !left_moving) {
+              auto left_call = id(motor_ear_left).make_call();
+              left_call.set_direction(left_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+              left_call.set_state(true);
+              left_call.perform();
+              ESP_LOGD("ears", "🚀 Left ear started moving (Direction: %s)", left_direction ? "Forward" : "Backward");
+          }
+
+          // ✅ Move right ear step-by-step
+          if (right_moving && current_time - id(right_last_step_time) >= right_step_time) {
+              id(right_last_step_time) = current_time;
+              id(right_ear_position) = (id(right_ear_position) + (right_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
+              id(right_ear_current_position).publish_state(id(right_ear_position) + 1);
+          }
+
+          // ✅ Move left ear step-by-step
+          if (left_moving && current_time - id(left_last_step_time) >= left_step_time) {
+              id(left_last_step_time) = current_time;
+              id(left_ear_position) = (id(left_ear_position) + (left_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
+              id(left_ear_current_position).publish_state(id(left_ear_position) + 1);
+          }
+
+          // ✅ Stop motors when target is reached (unless powered manually)
+          if (!right_should_move && right_moving) {
+              auto call = id(motor_ear_right).make_call();
+              call.set_state(false);
+              call.perform();
+              ESP_LOGD("ears", "✅ Right motor stopped (Reached Target)");
+          }
+
+          if (!left_should_move && left_moving) {
+              auto call = id(motor_ear_left).make_call();
+              call.set_state(false);
+              call.perform();
+              ESP_LOGD("ears", "✅ Left motor stopped (Reached Target)");
+          }
