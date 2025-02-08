@@ -1,2 +1,14 @@
 # nabaztag_ESPhome
-ESP Home based Nabaztag
+ESPHome based Nabaztag rebuild.
+
+
+_______________________________
+
+
+Work in progress items:
+
+___
+Custom wake word
+
+___
+LED matrix
