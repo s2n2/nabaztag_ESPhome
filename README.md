@@ -1,7 +1,8 @@
 # nabaztag_ESPhome
 ESPHome based Nabaztag rebuild.
 
-
+Reference sources:
+https://www.instructables.com/Hack-the-Nabaztag/
 _______________________________
 
 
