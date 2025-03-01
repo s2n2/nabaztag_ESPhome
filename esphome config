@@ -1,6 +1,86 @@
+################################################################################
+# Nabaztag ESP32 Implementation
+#
+# Hardware Requirements:
+# - ESP32 Development Board
+# - 2x H-Bridge Motor Controllers (for ears)
+# - WS2812B LED Matrix (256 LEDs)
+# - Button on GPIO27 and GPIO14 (Head button)
+#
+# Pin Configuration:
+# Right Ear:
+#   - Forward Pin: GPIO21
+#   - Reverse Pin: GPIO3
+# Left Ear:
+#   - Forward Pin: GPIO19
+#   - Reverse Pin: GPIO18
+# LED Matrix:
+#   - Data Pin: GPIO13
+#
+# Ear Position System:
+# - 20 positions per ear (0-19)
+# - Position tracking via timing:
+#   - Full rotation time: 12600ms
+#   - Each step = rotation_time / 20
+#
+# Features:
+#
+# 1. Ear Control:
+#   - Individual power and direction control
+#   - Position tracking (0-19)
+#   - Two stop behaviors:
+#     a) Instant Stop
+#     b) Return to Target
+#   - Auto-move to target positions
+#   - Synchronized movement option
+#
+# 2. LED Matrix:
+#   - 256 WS2812B LEDs
+#   - JSON-based pattern control
+#   - Built-in effects (Rainbow, Scan, Twinkle)
+#   - Current limiting for safety
+#   - Brightness control (0-255)
+#
+# 3. Position Reset:
+#   - Long press head button (>1s)
+#   - Resets position counters
+#   - Wiggle confirmation sequence
+#
+# Safety Features:
+# - Motor direction change delay (30ms)
+# - LED current monitoring and limiting
+# - Position tracking to prevent overrotation
+#
+# JSON LED Control:
+# Format: {"on":true, "bri":255, "seg":{"i":["RRGGBB"...]}}
+# - on: true/false for matrix power
+# - bri: 0-255 brightness
+# - seg.i: Array of 256 hex color values
+# - Invalid/undefined LEDs default to off
+#
+################################################################################
+
+
 substitutions:
   name: nabaztag_esp
   friendly_name: Nabaztag
+  max_current_ma: "2000"  # 🔥 Max Safe Current (in mA)
+  num_leds: "256"         # 🔆 Total Number of LEDs
+  direction_change_ms: "30"  # ⚡ Motor direction change delay (in ms)
+  min_movement_ms: "100"  # 🔄 Minimum time needed for motor to start moving
+  motor_startup_ms: "120"
+  right_ear_rotation_time: "12600" # 11894ms for full rotation
+  left_ear_rotation_time: "12600" # 12540ms for full rotation
+  right_ear_offset_ms: "70"  # Additional delay for right ear to match left ear timing
+  config_timeout: '5s'
+
+  error_phase: 'Error'
+  idle_phase: 'Idle'
+  listening_phase: 'Listening'
+  thinking_phase: 'Thinking'
+  replying_phase: 'Replying'
+  not_ready_phase: 'Not Ready'
+  muted_phase: 'Mic Muted'
 
 esphome:
   name: ${name}
@@ -10,31 +90,33 @@ esphome:
     name: esphome.web
     version: '1.0'
   on_boot:
-    priority: 600
+    priority: -100
     then:
+      - output.turn_on: button_ground
       - lambda: |-
-          id(right_ear_direction) = true;
-          id(left_ear_direction) = true;
-
-          auto right_call = id(motor_ear_right).make_call();
-          right_call.set_direction(fan::FanDirection::FORWARD);
-          right_call.perform();
-
-          auto left_call = id(motor_ear_left).make_call();
-          left_call.set_direction(fan::FanDirection::FORWARD);
-          left_call.perform();
-
-          ESP_LOGD("ears", "Default direction set to Forward on boot.");
+          ESP_LOGI("MIC", "I2S Audio initialization starting");
 
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
+    version: recommended
 
 logger:
-  level: WARN
+  level: DEBUG
+  logs:
+    i2s_audio: DEBUG    # Increased logging for I2S
+    microphone: DEBUG   # Increased logging for microphone
 
 api:
+  services:
+    - service: set_led_matrix_json
+      variables:
+        json_str: string
+      then:
+        - text_sensor.template.publish:
+            id: led_matrix_json
+            state: !lambda 'return json_str;'
 
 ota:
   platform: esphome
@@ -51,38 +133,160 @@ web_server:
 binary_sensor:
   - platform: gpio
     pin:
-      number: GPIO15
+      number: GPIO14
       mode:
         input: true
         pullup: true
     name: "Button Head"
+    id: button_head
     filters:
       - invert
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+
+
     on_press:
-      - delay: 1s  # Wait 1 second to detect a long press
-      - lambda: |-
-          ESP_LOGD("ears", "Long button press detected. Resetting ears.");
+      - if:
+          condition:
+            - voice_assistant.is_running
+          then:
+            - if:
+                condition:
+                  - text_sensor.state:
+                      id: va_state
+                      state: ${idle_phase}
+                then:
+                  - switch.template.publish:
+                      id: use_wake_word
+                      state: OFF
+                  - wait_until:
+                      not:
+                        voice_assistant.is_running
+                  - lambda: "id(use_wake_word_forced_off) = true;"
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "${listening_phase}"
+                  - script.execute: sound_beep
+                  - delay: 400ms
+                  - voice_assistant.start
+          else:
+            - if:
+                condition:
+                  - text_sensor.state:
+                      id: va_state
+                      state: ${muted_phase}
+                then:
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "${listening_phase}"
+                  - script.execute: sound_beep
+                  - delay: 400ms
+                  - voice_assistant.start
 
-          id(right_ear_position) = 1;
-          id(left_ear_position) = 1;
-          ESP_LOGD("ears", "Ear positions reset to 1.");
 
-          // Wiggle ears to confirm reset
-          for (int i = 0; i < 3; i++) {
-              id(motor_ear_right).turn_on();
-              id(motor_ear_left).turn_on();
-              delay(200);
-              id(motor_ear_right).turn_off();
-              id(motor_ear_left).turn_off();
-              delay(200);
-          }
-          ESP_LOGD("ears", "Ears wiggled to confirm reset.");
-
-          // Set target to 0 and return
-          id(target_right_ear_position) = 1;
-          id(target_left_ear_position) = 1;
+    on_state:
+      then:
+        - lambda: |-
+            static uint32_t press_start_time = 0;
+            static uint32_t wiggle_start_time = 0;
+            static uint8_t wiggle_state = 0;
+            
+            if (id(button_head).state) {
+              // Button pressed - store start time
+              press_start_time = millis();
+              
+              // Short press toggles voice assistant
+              if (!id(va).is_running()) {
+                id(use_wake_word).turn_on();
+                id(va_state).publish_state("${listening_phase}");
+              } else {
+                id(use_wake_word).turn_off();
+                id(va_state).publish_state("${muted_phase}");
+              }
+            } else if (press_start_time > 0 && (millis() - press_start_time) >= 1000) {
+              // Long press detected - position reset sequence
+              ESP_LOGD("ears", "Long press detected - Starting position reset sequence");
+              
+              // Reset current positions to 0
+              id(right_ear_position) = 0;
+              id(left_ear_position) = 0;
+              
+              // Reset target positions to 0
+              id(target_right_ear_position) = 0;
+              id(target_left_ear_position) = 0;
+              
+              // Update position sensors and targets
+              id(right_ear_current_position).publish_state(0);
+              id(left_ear_current_position).publish_state(0);
+              id(right_ear_target_number).publish_state(0);
+              id(left_ear_target_number).publish_state(0);
+              
+              // Clear stop flags during wiggle sequence
+              id(right_stop_at_target) = false;
+              id(left_stop_at_target) = false;
+              
+              // Start wiggle sequence
+              wiggle_start_time = millis();
+              wiggle_state = 1;
+              
+              // Start both motors forward
+              id(start_motors_fn)(true, true);
+              
+              press_start_time = 0;
+            }
+            
+            // Handle wiggle sequence states
+            if (wiggle_state > 0) {
+              uint32_t wiggle_elapsed = millis() - wiggle_start_time;
+              
+              if (wiggle_state == 1 && wiggle_elapsed >= 200) {
+                // Switch to backward after 200ms
+                id(start_motors_fn)(false, false);
+                wiggle_state = 2;
+              }
+              else if (wiggle_state == 2 && wiggle_elapsed >= 400) {
+                // After wiggle, handle based on stop behavior
+                if (id(right_stop_behavior) == 0) {  // Stop Instantly
+                    // Update target to current position
+                    id(target_right_ear_position) = id(right_ear_position);
+                    id(right_ear_target_number).publish_state(id(right_ear_position));
+                    // Stop motor
+                    auto right_call = id(motor_ear_right).make_call();
+                    right_call.set_state(false);
+                    right_call.perform();
+                    id(right_ear_power).publish_state(false);
+                } else {  // Return to target
+                    id(right_stop_at_target) = true;
+                    // Ensure motor is running to return to target
+                    id(start_motors_fn)(true, id(left_ear_direction));
+                }
+                
+                if (id(left_stop_behavior) == 0) {  // Stop Instantly
+                    // Update target to current position
+                    id(target_left_ear_position) = id(left_ear_position);
+                    id(left_ear_target_number).publish_state(id(left_ear_position));
+                    // Stop motor
+                    auto left_call = id(motor_ear_left).make_call();
+                    left_call.set_state(false);
+                    left_call.perform();
+                    id(left_ear_power).publish_state(false);
+                } else {  // Return to target
+                    id(left_stop_at_target) = true;
+                    // Ensure motor is running to return to target
+                    id(start_motors_fn)(id(right_ear_direction), true);
+                }
+                
+                wiggle_state = 0;
+              }
+            }
+            
 
 output:
+  - platform: gpio
+    pin: GPIO27
+    id: button_ground
+    inverted: true
+    
   - platform: ledc
     id: motor_forward_pin_rightear
     pin: GPIO21
@@ -127,12 +331,12 @@ globals:
   - id: right_ear_rotation_time
     type: int
     restore_value: no
-    initial_value: '11894'
+    initial_value: '12600'  # 11894ms for full rotation
 
   - id: left_ear_rotation_time
     type: int
     restore_value: no
-    initial_value: '12540'
+    initial_value: '12600'  # 12540ms for full rotation
 
   - id: right_ear_position
     type: int
@@ -199,29 +403,209 @@ globals:
     restore_value: yes
     initial_value: '1'  # 0 = Stop Instantly, 1 = Return to Target
 
+  - id: led_brightness
+    type: int
+    restore_value: no
+    initial_value: '255'
+
+  - id: start_motors_fn
+    type: std::function<void(bool, bool)>
+    restore_value: no
+    initial_value: 'nullptr'
+
+  - id: 'use_wake_word_forced_off'
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 number:
   - platform: template
-    name: "Right Ear Target Position"
-    id: right_ear_target_number
-    min_value: 1
-    max_value: 20
+    name: "Master Ear Target Position"
+    id: master_ear_target
+    min_value: 0
+    max_value: 19
     step: 1
-    initial_value: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: no
     set_action:
       - lambda: |-
-          id(target_right_ear_position) = int(x) - 1; // Convert 1-20 to 0-19 internally
+          int target = int(x);
+          
+          // Update both ear targets
+          id(target_right_ear_position) = target;
+          id(target_left_ear_position) = target;
+          
+          // Update the displayed target numbers
+          id(right_ear_target_number).publish_state(target);
+          id(left_ear_target_number).publish_state(target);
+          
+          // If auto-move is on, start movement to target
+          if (id(auto_move_to_target).state) {
+              // Set stop at target flags
+              id(right_stop_at_target) = true;
+              id(left_stop_at_target) = true;
+              
+              // Calculate shortest paths for both ears
+              int right_current = id(right_ear_position);
+              int left_current = id(left_ear_position);
+              int steps = id(ear_steps);
+              
+              // Calculate distances for right ear
+              int right_forward_dist = (target - right_current + steps) % steps;
+              int right_backward_dist = (right_current - target + steps) % steps;
+              bool right_direction = (right_forward_dist <= right_backward_dist);
+              
+              // Calculate distances for left ear
+              int left_forward_dist = (target - left_current + steps) % steps;
+              int left_backward_dist = (left_current - target + steps) % steps;
+              bool left_direction = (left_forward_dist <= left_backward_dist);
+              
+              // Update directions
+              id(right_ear_direction) = right_direction;
+              id(left_ear_direction) = left_direction;
+              
+              // Start motors in correct directions
+              auto right_call = id(motor_ear_right).make_call();
+              right_call.set_direction(right_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+              right_call.set_state(true);
+              right_call.perform();
+              
+              auto left_call = id(motor_ear_left).make_call();
+              left_call.set_direction(left_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+              left_call.set_state(true);
+              left_call.perform();
+              
+              // Update direction switches to match
+              id(right_ear_direction_switch).publish_state(right_direction);
+              id(left_ear_direction_switch).publish_state(left_direction);
+          }
+
+  - platform: template
+    name: "Right Ear Target Position"
+    id: right_ear_target_number
+    min_value: 0
+    max_value: 19
+    step: 1
+    initial_value: 0
+    set_action:
+      - lambda: |-
+          id(target_right_ear_position) = int(x);
+          
+          // Only start moving to target if auto move is enabled
+          if (id(auto_move_to_target).state) {
+              id(right_stop_at_target) = true;
+              
+              // Only calculate shortest path if motor isn't already running
+              if (!id(motor_ear_right).state) {
+                  // Calculate shortest path
+                  int current = id(right_ear_position);
+                  int target = id(target_right_ear_position);
+                  int steps = id(ear_steps);
+                  
+                  // Calculate distances in both directions
+                  int forward_dist = (target - current + steps) % steps;
+                  int backward_dist = (current - target + steps) % steps;
+                  
+                  // Set direction based on shortest path
+                  bool new_direction = (forward_dist <= backward_dist);
+                  id(right_ear_direction) = new_direction;
+                  
+                  // Update direction in motor
+                  auto right_call = id(motor_ear_right).make_call();
+                  right_call.set_direction(new_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+                  right_call.set_state(true);
+                  right_call.perform();
+                  
+                  // Update direction switch to match
+                  id(right_ear_direction_switch).publish_state(new_direction);
+              }
+          }
           
   - platform: template
     name: "Left Ear Target Position"
     id: left_ear_target_number
-    min_value: 1
-    max_value: 20
+    min_value: 0
+    max_value: 19
     step: 1
-    initial_value: 1
+    initial_value: 0
     set_action:
       - lambda: |-
-          id(target_left_ear_position) = int(x) - 1; // Convert 1-20 to 0-19 internally
+          id(target_left_ear_position) = int(x);
+          
+          // Only start moving to target if auto move is enabled
+          if (id(auto_move_to_target).state) {
+              id(left_stop_at_target) = true;
+              
+              // Only calculate shortest path if motor isn't already running
+              if (!id(motor_ear_left).state) {
+                  // Calculate shortest path
+                  int current = id(left_ear_position);
+                  int target = id(target_left_ear_position);
+                  int steps = id(ear_steps);
+                  
+                  // Calculate distances in both directions
+                  int forward_dist = (target - current + steps) % steps;
+                  int backward_dist = (current - target + steps) % steps;
+                  
+                  // Set direction based on shortest path
+                  bool new_direction = (forward_dist <= backward_dist);
+                  id(left_ear_direction) = new_direction;
+                  
+                  // Update direction in motor
+                  auto left_call = id(motor_ear_left).make_call();
+                  left_call.set_direction(new_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+                  left_call.set_state(true);
+                  left_call.perform();
+                  
+                  // Update direction switch to match
+                  id(left_ear_direction_switch).publish_state(new_direction);
+              }
+          }
+
+  - platform: template
+    name: "Right Forward Speed"
+    id: right_forward_speed
+    min_value: 80
+    max_value: 100
+    step: 1
+    initial_value: 96
+    restore_value: yes
+    optimistic: true
+    unit_of_measurement: "%"
+
+  - platform: template
+    name: "Right Backward Speed"
+    id: right_backward_speed
+    min_value: 80
+    max_value: 100
+    step: 1
+    initial_value: 100
+    restore_value: yes
+    optimistic: true
+    unit_of_measurement: "%"
+
+  - platform: template
+    name: "Left Forward Speed"
+    id: left_forward_speed
+    min_value: 80
+    max_value: 100
+    step: 1
+    initial_value: 100
+    restore_value: yes
+    optimistic: true
+    unit_of_measurement: "%"
+
+  - platform: template
+    name: "Left Backward Speed"
+    id: left_backward_speed
+    min_value: 80
+    max_value: 100
+    step: 1
+    initial_value: 96
+    restore_value: yes
+    optimistic: true
+    unit_of_measurement: "%"
 
 sensor:
   - platform: template
@@ -229,14 +613,15 @@ sensor:
     id: right_ear_current_position
     accuracy_decimals: 0
     lambda: |-
-      return id(right_ear_position) + 1; // Convert 0-19 to 1-20 for UI
+      return id(right_ear_position);
 
   - platform: template
     name: "Left Ear Current Position"
     id: left_ear_current_position
     accuracy_decimals: 0
     lambda: |-
-      return id(left_ear_position) + 1; // Convert 0-19 to 1-20 for UI
+      return id(left_ear_position);
+
 
 switch:
   - platform: template
@@ -246,6 +631,7 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - lambda: |-
+          id(right_stop_at_target) = false;
           auto right_call = id(motor_ear_right).make_call();
           right_call.set_state(true);
           right_call.perform();
@@ -253,17 +639,19 @@ switch:
     turn_off_action:
       - lambda: |-
           if (id(right_stop_behavior) == 1) {
+              // Return to target mode - don't update target
               if (!id(right_stop_at_target)) {
                   id(right_stop_at_target) = true;
-                  ESP_LOGD("ears", "Right ear manually turned OFF, but returning to target.");
+                  ESP_LOGD("ears", "Right ear manually turned OFF, returning to target: %d", id(target_right_ear_position));
               }
           } else {
+              // Instant stop mode - update target to current position
               id(target_right_ear_position) = id(right_ear_position);
               id(right_stop_at_target) = false;
               auto right_call = id(motor_ear_right).make_call();
               right_call.set_state(false);
               right_call.perform();
-              ESP_LOGD("ears", "Right ear manually turned OFF (Instant stop).");
+              ESP_LOGD("ears", "Right ear manually turned OFF (Instant stop). Target updated to: %d", id(right_ear_position));
               id(right_ear_power).publish_state(false);
           }
 
@@ -274,6 +662,7 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
       - lambda: |-
+          id(left_stop_at_target) = false;
           auto left_call = id(motor_ear_left).make_call();
           left_call.set_state(true);
           left_call.perform();
@@ -281,17 +670,19 @@ switch:
     turn_off_action:
       - lambda: |-
           if (id(left_stop_behavior) == 1) {
+              // Return to target mode - don't update target
               if (!id(left_stop_at_target)) {
                   id(left_stop_at_target) = true;
-                  ESP_LOGD("ears", "Left ear manually turned OFF, but returning to target.");
+                  ESP_LOGD("ears", "Left ear manually turned OFF, returning to target: %d", id(target_left_ear_position));
               }
           } else {
+              // Instant stop mode - update target to current position
               id(target_left_ear_position) = id(left_ear_position);
               id(left_stop_at_target) = false;
               auto left_call = id(motor_ear_left).make_call();
               left_call.set_state(false);
               left_call.perform();
-              ESP_LOGD("ears", "Left ear manually turned OFF (Instant stop).");
+              ESP_LOGD("ears", "Left ear manually turned OFF (Instant stop). Target updated to: %d", id(left_ear_position));
               id(left_ear_power).publish_state(false);
           }
 
@@ -303,20 +694,12 @@ switch:
     turn_on_action:
       - lambda: |-
           if (!id(right_stop_at_target)) {
-              id(right_ear_direction) = true;
-              auto right_call = id(motor_ear_right).make_call();
-              right_call.set_direction(fan::FanDirection::FORWARD);
-              right_call.perform();
-              ESP_LOGD("ears", "Right ear direction set to Forward.");
+              id(start_motors_fn)(true, id(left_ear_direction));
           }
     turn_off_action:
       - lambda: |-
           if (!id(right_stop_at_target)) {
-              id(right_ear_direction) = false;
-              auto right_call = id(motor_ear_right).make_call();
-              right_call.set_direction(fan::FanDirection::REVERSE);
-              right_call.perform();
-              ESP_LOGD("ears", "Right ear direction set to Backward.");
+              id(start_motors_fn)(false, id(left_ear_direction));
           }
 
   - platform: template
@@ -327,20 +710,12 @@ switch:
     turn_on_action:
       - lambda: |-
           if (!id(left_stop_at_target)) {
-              id(left_ear_direction) = true;
-              auto left_call = id(motor_ear_left).make_call();
-              left_call.set_direction(fan::FanDirection::FORWARD);
-              left_call.perform();
-              ESP_LOGD("ears", "Left ear direction set to Forward.");
+              id(start_motors_fn)(id(right_ear_direction), true);
           }
     turn_off_action:
       - lambda: |-
           if (!id(left_stop_at_target)) {
-              id(left_ear_direction) = false;
-              auto left_call = id(motor_ear_left).make_call();
-              left_call.set_direction(fan::FanDirection::REVERSE);
-              left_call.perform();
-              ESP_LOGD("ears", "Left ear direction set to Backward.");
+              id(start_motors_fn)(id(right_ear_direction), false);
           }
 
   - platform: template
@@ -373,79 +748,648 @@ switch:
           id(left_stop_behavior) = 1; // Return to Target
           ESP_LOGD("ears", "Left ear stop behavior set to: Return to Target");
 
+  - platform: template
+    name: "Both Ears Stop"
+    id: both_ears_stop
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Stop both motors
+          auto right_call = id(motor_ear_right).make_call();
+          right_call.set_state(false);
+          right_call.perform();
+          
+          auto left_call = id(motor_ear_left).make_call();
+          left_call.set_state(false);
+          left_call.perform();
+          
+          // Update power states
+          id(right_ear_power).publish_state(false);
+          id(left_ear_power).publish_state(false);
+          
+          // Clear stop flags
+          id(right_stop_at_target) = false;
+          id(left_stop_at_target) = false;
+
+  - platform: template
+    name: "Both Ears Forward"
+    id: both_ears_forward
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(start_motors_fn)(true, true);
+
+  - platform: template
+    name: "Both Ears Backward"
+    id: both_ears_backward
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(start_motors_fn)(false, false);
+
+  - platform: template
+    name: "Windmill"
+    id: windmill
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(start_motors_fn)(true, false);
+
+  - platform: template
+    name: "Windmill Reverse"
+    id: windmill_reverse
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(start_motors_fn)(false, true);
+
+  - platform: template
+    name: "Move To Target"
+    id: both_to_joint_target
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          // Calculate shortest paths for both ears
+          int right_current = id(right_ear_position);
+          int right_target = id(target_right_ear_position);
+          int left_current = id(left_ear_position);
+          int left_target = id(target_left_ear_position);
+          int steps = id(ear_steps);
+          
+          // Calculate distances for right ear
+          int right_forward_dist = (right_target - right_current + steps) % steps;
+          int right_backward_dist = (right_current - right_target + steps) % steps;
+          bool right_direction = (right_forward_dist <= right_backward_dist);
+          
+          // Calculate distances for left ear
+          int left_forward_dist = (left_target - left_current + steps) % steps;
+          int left_backward_dist = (left_current - left_target + steps) % steps;
+          bool left_direction = (left_forward_dist <= left_backward_dist);
+          
+          // Start motors with calculated directions
+          id(start_motors_fn)(right_direction, left_direction);
+
+  - platform: template
+    name: "Auto Move To Target"
+    id: auto_move_to_target
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          // Set stop at target flags
+          id(right_stop_at_target) = true;
+          id(left_stop_at_target) = true;
+          
+          // Calculate shortest paths for both ears
+          int right_current = id(right_ear_position);
+          int right_target = id(target_right_ear_position);
+          int left_current = id(left_ear_position);
+          int left_target = id(target_left_ear_position);
+          int steps = id(ear_steps);
+          
+          // Calculate distances for right ear
+          int right_forward_dist = (right_target - right_current + steps) % steps;
+          int right_backward_dist = (right_current - right_target + steps) % steps;
+          bool right_direction = (right_forward_dist <= right_backward_dist);
+          
+          // Calculate distances for left ear
+          int left_forward_dist = (left_target - left_current + steps) % steps;
+          int left_backward_dist = (left_current - left_target + steps) % steps;
+          bool left_direction = (left_forward_dist <= left_backward_dist);
+          
+          // Update directions
+          id(right_ear_direction) = right_direction;
+          id(left_ear_direction) = left_direction;
+          
+          // Start motors in correct directions
+          auto right_call = id(motor_ear_right).make_call();
+          right_call.set_direction(right_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+          right_call.set_state(true);
+          right_call.perform();
+          
+          auto left_call = id(motor_ear_left).make_call();
+          left_call.set_direction(left_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
+          left_call.set_state(true);
+          left_call.perform();
+          
+          // Update direction switches to match
+          id(right_ear_direction_switch).publish_state(right_direction);
+          id(left_ear_direction_switch).publish_state(left_direction);
+
+  - platform: template
+    name: 'Use Wake Word'
+    id: use_wake_word
+    icon: 'mdi:chat-sleep'
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: "id(va).set_use_wake_word(true);"
+      - if:
+          condition:
+            not:
+              - voice_assistant.is_running
+          then:
+            - voice_assistant.start_continuous
+            - text_sensor.template.publish:
+                id: va_state
+                state: "${idle_phase}"
+
+    on_turn_off:
+      - lambda: "id(va).set_use_wake_word(false);"
+      - voice_assistant.stop
+      - text_sensor.template.publish:
+          id: va_state
+          state: "${muted_phase}"
+
 interval:
   - interval: 50ms
     then:
       - lambda: |-
           int current_time = millis();
+          
+          // Calculate step times - no speed adjustment
           int right_step_time = id(right_ear_rotation_time) / id(ear_steps);
           int left_step_time = id(left_ear_rotation_time) / id(ear_steps);
 
-          // ✅ Determine if ears should be moving
-          bool right_target_reached = (id(right_ear_position) == id(target_right_ear_position));
-          bool left_target_reached = (id(left_ear_position) == id(target_left_ear_position));
+          // Track if positions have changed
+          static int last_right_position = id(right_ear_position);
+          static int last_left_position = id(left_ear_position);
+          
+          // Update positions when motors are moving (manual or automatic)
+          if (id(motor_ear_right).state) {
+              bool right_direction = id(right_ear_direction);
+              
+              // Track direction changes
+              static bool last_right_direction = right_direction;
+              static unsigned long right_direction_change_time = 0;
+              static bool right_first_step = true;
 
-          bool right_moving = id(motor_ear_right).state;
-          bool left_moving = id(motor_ear_left).state;
-
-          bool right_power_on = id(right_ear_power).state;
-          bool left_power_on = id(left_ear_power).state;
-
-          bool right_should_move = right_power_on || !right_target_reached;
-          bool left_should_move = left_power_on || !left_target_reached;
-
-          // ✅ Calculate shortest path with wraparound
-          int right_distance_forward = (id(target_right_ear_position) - id(right_ear_position) + id(ear_steps)) % id(ear_steps);
-          int right_distance_backward = (id(right_ear_position) - id(target_right_ear_position) + id(ear_steps)) % id(ear_steps);
-          bool right_direction = (right_distance_forward <= right_distance_backward);
-
-          int left_distance_forward = (id(target_left_ear_position) - id(left_ear_position) + id(ear_steps)) % id(ear_steps);
-          int left_distance_backward = (id(left_ear_position) - id(target_left_ear_position) + id(ear_steps)) % id(ear_steps);
-          bool left_direction = (left_distance_forward <= left_distance_backward);
-
-          // ✅ Ensure right ear starts moving if required
-          if (right_should_move && !right_moving) {
-              auto right_call = id(motor_ear_right).make_call();
-              right_call.set_direction(right_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
-              right_call.set_state(true);
-              right_call.perform();
-              ESP_LOGD("ears", "🚀 Right ear started moving (Direction: %s)", right_direction ? "Forward" : "Backward");
+              if (last_right_direction != right_direction) {
+                  right_direction_change_time = current_time;
+                  last_right_direction = right_direction;
+                  right_first_step = true;
+                  ESP_LOGD("ears", "🔄 Right ear direction changed to: %s", right_direction ? "Forward" : "Backward");
+              }
+              
+              // Add half step offset only for first step after direction change
+              int step_offset = right_first_step ? (right_step_time/2) : 0;
+              
+              // Update position only after direction change delay and motor startup time, plus right ear offset
+              if ((current_time - id(right_last_step_time)) >= right_step_time && 
+                  current_time - right_direction_change_time >= (${direction_change_ms} + ${motor_startup_ms} + ${right_ear_offset_ms} + step_offset)) {
+                  id(right_last_step_time) = current_time;
+                  id(right_ear_position) = (id(right_ear_position) + (right_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
+                  id(right_ear_current_position).publish_state(id(right_ear_position));
+                  right_first_step = false;
+                  
+                  // Check if target reached and stop if needed
+                  if (id(right_stop_at_target) && id(right_ear_position) == id(target_right_ear_position)) {
+                      auto right_call = id(motor_ear_right).make_call();
+                      right_call.set_state(false);
+                      right_call.perform();
+                      id(right_ear_power).publish_state(false);
+                      id(right_stop_at_target) = false;
+                      ESP_LOGD("ears", "Right ear reached target position: %d", id(right_ear_position));
+                  }
+                  
+                  // Turn off control switches when position changes
+                  if (id(right_ear_position) != last_right_position) {
+                      id(both_ears_forward).publish_state(false);
+                      id(both_ears_backward).publish_state(false);
+                      id(windmill).publish_state(false);
+                      id(windmill_reverse).publish_state(false);
+                      id(both_to_joint_target).publish_state(false);
+                  }
+                  last_right_position = id(right_ear_position);
+              }
           }
 
-          // ✅ Ensure left ear starts moving if required
-          if (left_should_move && !left_moving) {
-              auto left_call = id(motor_ear_left).make_call();
-              left_call.set_direction(left_direction ? fan::FanDirection::FORWARD : fan::FanDirection::REVERSE);
-              left_call.set_state(true);
-              left_call.perform();
-              ESP_LOGD("ears", "🚀 Left ear started moving (Direction: %s)", left_direction ? "Forward" : "Backward");
+          if (id(motor_ear_left).state) {
+              bool left_direction = id(left_ear_direction);
+              
+              // Track direction changes
+              static bool last_left_direction = left_direction;
+              static unsigned long left_direction_change_time = 0;
+              static bool left_first_step = true;
+
+              if (last_left_direction != left_direction) {
+                  left_direction_change_time = current_time;
+                  last_left_direction = left_direction;
+                  left_first_step = true;
+                  ESP_LOGD("ears", "🔄 Left ear direction changed to: %s", left_direction ? "Forward" : "Backward");
+              }
+              
+              // Add half step offset only for first step after direction change
+              int step_offset = left_first_step ? (left_step_time/2) : 0;
+              
+              // Update position only after direction change delay and motor startup time
+              if ((current_time - id(left_last_step_time)) >= left_step_time && 
+                  current_time - left_direction_change_time >= (${direction_change_ms} + ${motor_startup_ms} + step_offset)) {
+                  id(left_last_step_time) = current_time;
+                  id(left_ear_position) = (id(left_ear_position) + (left_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
+                  id(left_ear_current_position).publish_state(id(left_ear_position));
+                  left_first_step = false;
+                  
+                  // Check if target reached and stop if needed
+                  if (id(left_stop_at_target) && id(left_ear_position) == id(target_left_ear_position)) {
+                      auto left_call = id(motor_ear_left).make_call();
+                      left_call.set_state(false);
+                      left_call.perform();
+                      id(left_ear_power).publish_state(false);
+                      id(left_stop_at_target) = false;
+                      ESP_LOGD("ears", "Left ear reached target position: %d", id(left_ear_position));
+                  }
+                  
+                  // Turn off control switches when position changes
+                  if (id(left_ear_position) != last_left_position) {
+                      id(both_ears_forward).publish_state(false);
+                      id(both_ears_backward).publish_state(false);
+                      id(windmill).publish_state(false);
+                      id(windmill_reverse).publish_state(false);
+                      id(both_to_joint_target).publish_state(false);
+                  }
+                  last_left_position = id(left_ear_position);
+              }
           }
 
-          // ✅ Move right ear step-by-step
-          if (right_moving && current_time - id(right_last_step_time) >= right_step_time) {
-              id(right_last_step_time) = current_time;
-              id(right_ear_position) = (id(right_ear_position) + (right_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
-              id(right_ear_current_position).publish_state(id(right_ear_position) + 1);
-          }
+#______________________________________________________
 
-          // ✅ Move left ear step-by-step
-          if (left_moving && current_time - id(left_last_step_time) >= left_step_time) {
-              id(left_last_step_time) = current_time;
-              id(left_ear_position) = (id(left_ear_position) + (left_direction ? 1 : -1) + id(ear_steps)) % id(ear_steps);
-              id(left_ear_current_position).publish_state(id(left_ear_position) + 1);
-          }
+# Add WLED component
 
-          // ✅ Stop motors when target is reached (unless powered manually)
-          if (!right_should_move && right_moving) {
-              auto call = id(motor_ear_right).make_call();
-              call.set_state(false);
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_matrix
+    pin: GPIO13
+    num_leds: 256
+    rgb_order: GRB
+    rmt_channel: 0
+    chipset: WS2811
+    name: "Nabaztag ESP LED Matrix"
+    effects:
+      - addressable_lambda:
+          name: "Custom Pattern"
+          update_interval: 16ms
+          lambda: |-
+            static auto last_processed_json = std::string("");
+            auto current_json = id(led_matrix_json).state;
+            
+            if (current_json.length() > 0 && current_json != last_processed_json) {
+              last_processed_json = current_json;
+              bool success = parse_json(current_json, [&](JsonObject root) {
+                if (!root.containsKey("seg") || !root["seg"].containsKey("i")) {
+                  // If no pattern data, fill all LEDs with the current color
+                  for (size_t i = 0; i < it.size(); i++) {
+                    it[i] = current_color;
+                  }
+                  return true;
+                }
+                JsonArray leds = root["seg"]["i"];
+                size_t num_leds = std::min(leds.size(), (size_t)256);
+                
+                ESP_LOGD("LED", "Processing array of size %d", leds.size());
+                
+                // Calculate total power draw and scale factor
+                float max_current_per_led = 0.06; // 60mA per LED at full brightness
+                float target_max_current = ${max_current_ma} / 1000.0; // Convert mA to A
+                
+                // Calculate potential maximum current based on active LEDs
+                float total_potential_current = 0;
+                for (size_t i = 0; i < num_leds; i++) {
+                    if (i >= leds.size()) break;
+                    
+                    JsonVariant led_value = leds[i];
+                    if (led_value.isNull()) continue;
+                    
+                    const char* color_str = led_value.as<const char*>();
+                    if (color_str == nullptr || strlen(color_str) != 6) continue;
+                    
+                    // Calculate relative power for this LED
+                    char hex[3] = {0};
+                    strncpy(hex, color_str, 2);
+                    float r = strtol(hex, NULL, 16) / 255.0;
+                    strncpy(hex, color_str + 2, 2);
+                    float g = strtol(hex, NULL, 16) / 255.0;
+                    strncpy(hex, color_str + 4, 2);
+                    float b = strtol(hex, NULL, 16) / 255.0;
+                    
+                    total_potential_current += max_current_per_led * (r + g + b) / 3.0;
+                }
+                
+                // Calculate power scaling factor
+                float power_scale = 1.0;
+                if (total_potential_current > target_max_current) {
+                    power_scale = target_max_current / total_potential_current;
+                    ESP_LOGW("LED", "Power limit active! Requested: %.2fA, Limited to: %.2fA. Scale: %.2f", 
+                            total_potential_current, target_max_current, power_scale);
+                }
+                
+                // Get user brightness (0-1.0)
+                float user_brightness = 1.0;
+                if (root.containsKey("bri")) {
+                    user_brightness = float(root["bri"]) / 255.0;
+                }
+                
+                // Combine power scaling with user brightness
+                float final_scale = power_scale * user_brightness;
+                
+                // First clear all LEDs
+                for (size_t i = 0; i < it.size(); i++) {
+                    it[i] = ESPColor(0, 0, 0);
+                }
+                
+                // Then set the pattern with power scaling
+                for (size_t i = 0; i < num_leds; i++) {
+                    if (i >= leds.size()) break;
+                    
+                    JsonVariant led_value = leds[i];
+                    if (led_value.isNull()) continue;
+                    
+                    const char* color_str = led_value.as<const char*>();
+                    if (color_str == nullptr || strlen(color_str) != 6) continue;
+                    
+                    char hex[3] = {0};
+                    
+                    // Parse and scale each color component
+                    strncpy(hex, color_str, 2);
+                    uint8_t r = strtol(hex, NULL, 16) * final_scale;
+                    
+                    strncpy(hex, color_str + 2, 2);
+                    uint8_t g = strtol(hex, NULL, 16) * final_scale;
+                    
+                    strncpy(hex, color_str + 4, 2);
+                    uint8_t b = strtol(hex, NULL, 16) * final_scale;
+                    
+                    it[i] = ESPColor(r, g, b);
+                }
+                
+                return true;
+              });
+            }
+      - addressable_rainbow:
+      - addressable_color_wipe:
+      - addressable_scan:
+      - addressable_twinkle:
+      - addressable_fireworks:
+      - addressable_flicker:
+
+text_sensor:
+  - platform: template
+    name: "LED Matrix JSON Input"
+    id: led_matrix_json
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGD("LED", "Received JSON: %s", x.c_str());
+            auto call = id(led_matrix)->make_call();
+            
+            bool success = parse_json(x, [&](JsonObject root) {
+              ESP_LOGD("LED", "Parsing JSON object");
+              
+              // Handle on/off
+              if (root.containsKey("on")) {
+                bool state = root["on"].as<bool>();
+                ESP_LOGD("LED", "Setting state: %s", state ? "ON" : "OFF");
+                call.set_state(state);
+              }
+              
+              // Handle brightness - now using direct value
+              if (root.containsKey("bri")) {
+                float brightness = float(root["bri"]) / 255.0;
+                ESP_LOGD("LED", "Setting brightness: %.2f", brightness);
+                call.set_brightness(brightness);
+              }
+              
+              // Always switch to custom pattern if we have a valid JSON
+              call.set_effect("Custom Pattern");
+              
+              return true;
+            });
+
+            if (!success) {
+              ESP_LOGE("LED", "Failed to parse JSON: %s", x.c_str());
+            } else {
+              ESP_LOGD("LED", "Performing light call");
               call.perform();
-              ESP_LOGD("ears", "✅ Right motor stopped (Reached Target)");
-          }
+            }
+  - platform: template
+    name: 'Status'
+    id: va_state
+    update_interval: never
 
-          if (!left_should_move && left_moving) {
-              auto call = id(motor_ear_left).make_call();
-              call.set_state(false);
-              call.perform();
-              ESP_LOGD("ears", "✅ Left motor stopped (Reached Target)");
-          }
+button:
+  - platform: template
+    name: "Both Ears Stop"
+    entity_category: "config"
+    on_press:
+      then:
+        - lambda: |-
+            // Stop both motors
+            auto right_call = id(motor_ear_right).make_call();
+            right_call.set_state(false);
+            right_call.perform();
+            
+            auto left_call = id(motor_ear_left).make_call();
+            left_call.set_state(false);
+            left_call.perform();
+            
+            // Update power states
+            id(right_ear_power).publish_state(false);
+            id(left_ear_power).publish_state(false);
+            
+            // Clear stop flags
+            id(right_stop_at_target) = false;
+            id(left_stop_at_target) = false;
+
+# I2S Audio Configuration
+i2s_audio:
+  - id: i2s_out
+    i2s_bclk_pin: GPIO26
+    i2s_lrclk_pin: GPIO25
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO15 # WS
+    i2s_bclk_pin: GPIO32 # SCK
+
+
+# Microphone Configuration
+microphone:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_in
+    id: external_microphone
+    adc_type: external
+    i2s_din_pin: GPIO33 # SD
+    pdm: false
+    channel: right
+    bits_per_sample: 32bit
+
+# Speaker Configuration
+speaker:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_out
+    id: external_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO22
+    i2s_mode: primary
+    sample_rate: 32000 #16000
+#    bits_per_sample: 8bit
+    
+voice_assistant:
+  id: va
+  microphone: external_microphone 
+  speaker: external_speaker
+  use_wake_word: false
+  noise_suppression_level: 2 # 0, 1, 2, 3, 4
+  auto_gain: 30dBFS # 0dBFS - 31dBFS
+  volume_multiplier: 2 # >0
+
+  on_wake_word_detected:
+    - script.execute: sound_beep
+
+  on_listening:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "${listening_phase}"
+
+  on_stt_vad_end:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "${thinking_phase}"
+    - script.execute: sound_beep
+    - delay: 160ms
+    - script.execute: sound_beep
+
+  on_tts_stream_start:
+    - text_sensor.template.publish:
+        id: va_state
+        state: "${replying_phase}"
+
+  on_tts_stream_end:
+    - script.execute: stop_listening
+
+  on_error:
+    - if:
+        condition:
+          and:
+            - text_sensor.state:
+                id: va_state
+                state: "${thinking_phase}"
+            - lambda: 'return (code == "stt-no-text-recognized");' # Error-code-text MUST be in double-quotes.
+        then:
+          - script.execute: stop_listening
+
+#    - logger.log:
+#        level: WARN
+#        format: "Err.code: %s Msg: %s"
+#        args: [ code.c_str(), message.c_str() ]
+#
+# [E][voice_assistant:653]: Error: no_wake_word - No wake word detected
+# [E][voice_assistant:653]: Error: stt-no-text-recognized - No text recognized
+
+  on_client_connected:
+    - if:
+        condition:
+          switch.is_on: use_wake_word
+        then:
+          - voice_assistant.start_continuous
+          - text_sensor.template.publish:
+              id: va_state
+              state: "${idle_phase}"
+        else:
+          - text_sensor.template.publish:
+              id: va_state
+              state: "${muted_phase}"
+
+  on_client_disconnected: 
+    - text_sensor.template.publish:
+        id: va_state
+        state: "${not_ready_phase}"
+
+
+script:
+
+
+  - id: stop_listening
+    then:
+      - if:
+          condition:
+            switch.is_on: use_wake_word
+          then:
+            - text_sensor.template.publish:
+                id: va_state
+                state: "${idle_phase}"
+          else:
+            - if:
+                condition:
+                  lambda: "return(id(use_wake_word_forced_off));"
+                then:
+                  - switch.template.publish:
+                      id: use_wake_word
+                      state: ON
+                  - lambda: "id(use_wake_word_forced_off) = false;"
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "${idle_phase}"
+                else:
+                  - text_sensor.template.publish:
+                      id: va_state
+                      state: "${muted_phase}"
+
+
+  - id: config_timeout_timer
+    mode: restart
+    then: 
+      - delay: ${config_timeout}
+
+
+  - id: sound_beep
+    then:
+      - if:
+          condition:
+            not:
+              - speaker.is_playing
+#                  id: external_speaker
+          then:
+            - speaker.play:
+                id: external_speaker
+                data: [0x00,0x00,0xFF,0x05,0x00,0xFE,0x00,0x00,0xFC,0x03,0x01,0xFD,0x02,0x01,0xFD,0x00,0x02,0xF9,0x03,0x00,0xFD,0xFF,0x03,0xFA,0x01,0x03,0xFC,0x01,0x02,0xFD,0x01,0x06,0xFA,0x03,0x02,0xFF,0xFE,0x05,0xFB,0xFF,0x03,0xFC,0xFF,
+                  0x01,0xFB,0xFB,0x05,0xFA,0x00,0x00,0x00,0xFB,0x07,0xFE,0xFF,0x03,0x00,0x00,0x05,0x01,0xFA,0x06,0xFD,0x00,0xFD,0x02,0xF6,0x04,0xFD,0xFD,0xFE,0xFF,0xF9,0x02,0x03,0xFA,0x04,0x00,0x03,0xFE,0x0A,0xF9,0x05,0x00,0x03,0xFE,0x05,
+                  0xF9,0xFE,0x01,0xFB,0xFD,0xFB,0x00,0xF5,0x07,0xF9,0x02,0xFA,0x05,0xFA,0x0B,0xFF,0x01,0x02,0x07,0x01,0x01,0x07,0xF7,0x05,0xFC,0x03,0xF6,0x05,0xF0,0x03,0xFB,0xFF,0xF5,0x05,0xFB,0xFD,0x09,0xFC,0x02,0x00,0x0B,0xFA,0x11,0xF8,
+                  0x06,0xFF,0x0C,0xF2,0x08,0xFA,0xF7,0x00,0xFF,0xF8,0xF8,0x04,0xEE,0x0A,0xFA,0x00,0xF7,0x14,0xF1,0x0E,0x05,0x00,0xFE,0x0F,0xFE,0xFF,0x0C,0xF1,0x03,0x01,0xFF,0xE9,0x12,0xE8,0xFF,0xFF,0x01,0xEC,0x0D,0xF9,0xFB,0x10,0xFD,0xFD,
+                  0x0C,0x10,0xED,0x1D,0xF7,0xFF,0x00,0x11,0xE6,0x0F,0xF7,0xF1,0x02,0x03,0xE8,0xFD,0x0C,0xE2,0x10,0x01,0xFB,0xF7,0x1E,0xE9,0x15,0x09,0xFC,0xFE,0x1D,0xEF,0xFE,0x15,0xE7,0xFE,0x08,0xF9,0xE4,0x19,0xDE,0xFF,0x05,0xFC,0xE4,0x21,
+                  0xF2,0xF8,0x1C,0xFD,0xF5,0x16,0x0D,0xE9,0x26,0xF3,0xF9,0x0A,0x0F,0xD4,0x1B,0xF4,0xE6,0x07,0x07,0xDD,0x07,0x0B,0xDD,0x18,0x04,0xF0,0x04,0x28,0xDB,0x1E,0x0F,0xF2,0xFF,0x24,0xE3,0x04,0x16,0xDE,0x00,0x10,0xE7,0xE6,0x25,0xD4,
+                  0xFF,0x11,0xF6,0xE4,0x2C,0xE9,0xFC,0x23,0xF7,0xF3,0x29,0x00,0xE4,0x2F,0xED,0xEF,0x13,0x08,0xD0,0x24,0xEC,0xE3,0x10,0x01,0xD2,0x1A,0x08,0xD8,0x22,0x09,0xE7,0x10,0x24,0xD6,0x27,0x0D,0xE9,0x0B,0x24,0xD1,0x0D,0x15,0xD4,0x01,
+                  0x17,0xDB,0xF1,0x23,0xCE,0x05,0x17,0xE8,0xF0,0x37,0xDF,0x01,0x2B,0xF0,0xF2,0x30,0xF3,0xEB,0x31,0xE5,0xEE,0x1E,0xF4,0xD0,0x2B,0xE5,0xDF,0x1B,0xFD,0xD2,0x25,0xFE,0xDB,0x2A,0x04,0xE3,0x24,0x19,0xD4,0x2C,0x0C,0xDE,0x13,0x1B,
+                  0xCD,0x16,0x0E,0xCF,0x0A,0x11,0xCD,0x02,0x1F,0xCD,0x0B,0x1E,0xE0,0xFD,0x31,0xDB,0x0A,0x2B,0xE7,0xFE,0x32,0xE2,0xF3,0x2D,0xDF,0xEC,0x24,0xE7,0xDD,0x29,0xDF,0xE4,0x22,0xEE,0xDD,0x2E,0xF6,0xE3,0x2E,0x01,0xE2,0x2B,0x09,0xDD,
+                  0x2D,0x04,0xDD,0x20,0x08,0xCE,0x1A,0x06,0xCF,0x10,0x0E,0xCE,0x0F,0x13,0xD2,0x12,0x19,0xDA,0x12,0x26,0xDD,0x0F,0x27,0xE0,0x04,0x28,0xDD,0xFF,0x24,0xDB,0xF5,0x20,0xD8,0xEE,0x21,0xE0,0xEB,0x26,0xE8,0xEB,0x29,0xEF,0xED,0x2C,
+                  0xF7,0xEE,0x2F,0xF9,0xE8,0x25,0xFE,0xDD,0x22,0xFB,0xDC,0x19,0xFE,0xD5,0x16,0xFE,0xD7,0x18,0x09,0xDD,0x15,0x16,0xDD,0x1A,0x15,0xE4,0x12,0x1D,0xE0,0x12,0x16,0xDE,0x05,0x16,0xDD,0xFB,0x19,0xDA,0xFD,0x15,0xE3,0xF4,0x1F,0xE2,
+                  0x00,0x1F,0xF1,0xF8,0x25,0xF3,0xF5,0x24,0xF1,0xF5,0x1D,0xF8,0xE8,0x1E,0xEC,0xEB,0x12,0xFA,0xE1,0x17,0xF9,0xE6,0x17,0xFF,0xE9,0x14,0x0A,0xE8,0x1E,0x05,0xF0,0x0F,0x12,0xE4,0x12,0x08,0xE8,0x09,0x0B,0xE5,0x02,0x0B,0xE0,0x07,
+                  0x08,0xEF,0xF8,0x19,0xE9,0x02,0x12,0xF5,0xF9,0x19,0xFA,0xF9,0x1B,0xF6,0xFA,0x0D,0x04,0xEA,0x14,0xFA,0xF1,0x08,0x03,0xEA,0x06,0x03,0xE8,0x09,0x03,0xF4,0xFD,0x11,0xED,0x08,0x0B,0xF8,0xFE,0x12,0xF9,0xFF,0x12,0xF6,0xFF,0x09,
+                  0x00,0xF1,0x0F,0xF6,0xF8,0x05,0x00,0xF1,0x06,0xFE,0xF1,0x08,0xFF,0xF9,0x00,0x0A,0xF3,0x09,0x04,0xFB,0x01,0x0B,0xFA,0x03,0x09,0xF7,0x01,0x04,0xFD,0xF8,0x09,0xF6,0xFD,0x03,0xFD,0xF8,0x04,0xFB,0xFA,0x07,0xFD,0xFD,0x02,0x04,
+                  0xF9,0x08,0x00,0xFE,0x02,0x04,0xFC,0x04,0x02,0xFA,0x02,0x00,0xFC,0xFE,0x03,0xF9,0x00,0x01,0xFD,0xFD,0x03,0xFB,0x00,0x03,0xFE,0xFF,0x03,0x01,0xFC,0x06,0xFD,0x01,0x00,0x00,0xFE,0x00,0x00,0xFB,0x03,0xFD,0x00,0xFF,0x00,0x00]
+            - wait_until:
+                not:
+                  speaker.is_playing
+
+
+  - id: sound_key_click
+    then:
+      - if:
+          condition:
+            or:
+              - text_sensor.state:
+                  id: va_state
+                  state: ${replying_phase} );"
+              - speaker.is_playing
+#                  id: external_speaker
+          else:
+            - speaker.play:
+                id: external_speaker
+                data: [0x01,0x02,0x04,0x06,0x07,0x08,0x08,0x06,0x01,0xFA,0xF4,0xEF,0xEE,0xF1,0xF7,0xFF,0x07,0x0E,0x11,0x11,0x10,0x0C,0x06,0xFF,0xF8,0xF1,0xEC,0xEA,0xEC,0xEA,0xF2,0xF9,0xFF,0x05,0x0A,0x10,0x14,0x17,0x17,0x14,0x0B,0xFD,0xED,
+                  0xE0,0xD9,0xDB,0xE6,0xF7,0x0A,0x19,0x20,0x1E,0x14,0x05,0xF4,0xE5,0xDF,0xE4,0xF4,0x0C,0x24,0x36,0x3D,0x35,0x20,0xFF,0xDD,0xC0,0xAE,0xA9,0xB0,0xC4,0xE0,0x03,0x26,0x48,0x62,0x70,0x6D,0x59,0x35,0x08,0xD8,0xAC,0x8D,0x80,
+                  0x85,0x9C,0xC1,0xF0,0x21,0x4E,0x6F,0x7F,0x7A,0x63,0x3D,0x0F,0xE0,0xB7,0x9B,0x90,0x96,0xAC,0xCE,0xF6,0x1D,0x3C,0x50,0x55,0x4D,0x3A,0x20,0x04,0xEC,0xD8,0xCC,0xC9,0xCD,0xD8,0xE8,0xF9,0x0A,0x17,0x1F,0x20,0x1C,0x12,0x07,
+                  0xFC,0xF2,0xEC,0xEB,0xED,0xF3,0xFA,0x02,0x0A,0x10,0x12,0x12,0x0E,0x07,0xFE,0xF5,0xED,0xEA,0xEB,0xEF,0xF7,0x00,0x0A,0x10,0x13,0x12,0x0F,0x09,0x02,0xFB,0xF5,0xF3,0xF2,0xF3,0xF6,0xFB,0xFF,0x03,0x05,0x07,0x08,0x07,0x05,
+                  0x03,0x01,0xFF,0xFE,0xFC,0xFB,0xFB,0xFC,0xFC,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x02,0x01]
+            - wait_until:
+                not:
+                  - speaker.is_playing
+#                      id: external_speaker
